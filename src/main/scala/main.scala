@@ -34,46 +34,40 @@ object Main {
     println("-----")
     sc.stop()
   }
-  def main(args:Array[String]) = {
-    val dataDir = "/home/brycemcd/Cricket/mlib/"
-    val data = sc.textFile(dataDir + "data/collab_filter.txt")
 
-    println(data)
-
-    val myRatings = loadRatings("data/personalRatings.txt")
-    val myRatingsRDD = sc.parallelize(myRatings)
-
-    val movieLensHomeDir = dataDir + "data/"
-
-    //val myRatings = loadRatings("data/personalRatings.txt")
-    //val myRatings = sc.textFile(new File(movieLensHomeDir, "personalRatings.txt").toString).map { line =>
-      //val fields = line.split("::")
-      //// format: (timestamp % 10, Rating(userId, movieId, rating))
-      //(fields(3).toLong % 10, Rating(fields(0).toInt, fields(1).toInt, fields(2).toDouble))
-    //}
-
+  val dataDir = "/home/brycemcd/Cricket/mlib/"
+  val movieLensHomeDir = dataDir + "data/"
+  def buildRatingsTuple() = {
     println("crunching ratings")
     val ratings = sc.textFile(new File(movieLensHomeDir, "ratings.dat").toString).map { line =>
       val fields = line.split("::")
       // format: (timestamp % 10, Rating(userId, movieId, rating))
       (fields(3).toLong % 10, Rating(fields(0).toInt, fields(1).toInt, fields(2).toDouble))
     }
-
-    println("crunching movies")
-    val movies = sc.textFile(new File(movieLensHomeDir, "movies.dat").toString).map { line =>
-      val fields = line.split("::")
-      //format: (movieId, movieName)
-      (fields(0).toInt, fields(1))
-    } //.collect().toMap
-
     val numRatings = ratings.count
     val numUsers = ratings.map(_._2.user).distinct.count
     val numMovies = ratings.map(_._2.product).distinct.count
 
     println("Got " + numRatings + " ratings from "
       + numUsers + " users on " + numMovies + " movies.")
+    ratings
+  }
 
+  def buildMoviesTuple() = {
+    println("crunching movies")
+    val movies = sc.textFile(new File(movieLensHomeDir, "movies.dat").toString).map { line =>
+      val fields = line.split("::")
+      //format: (movieId, movieName)
+      (fields(0).toInt, fields(1))
+    }
+    movies
+  }
+
+  def partitionData(ratings: RDD[(Long, Rating)],
+    myRatingsRDD: RDD[Rating]) : Tuple3[RDD[Rating], RDD[Rating], RDD[Rating]]  = {
     val numPartitions = 4
+    // NOTE: caching these values results in out of heap errors. Not caching them
+    // is not very expensive
     val training = ratings.filter(x => x._1 < 6)
       .values
       .union(myRatingsRDD)
@@ -82,7 +76,7 @@ object Main {
     val validation = ratings.filter(x => x._1 >= 6 && x._1 < 8)
       .values
       .repartition(numPartitions)
-      //.cache()
+      ////.cache()
     val test = ratings.filter(x => x._1 >= 8).values //.cache()
 
     val numTraining = training.count()
@@ -90,11 +84,19 @@ object Main {
     val numTest = test.count()
 
     println("Training: " + numTraining + ", validation: " + numValidation + ", test: " + numTest)
+    (training, validation, test)
+  }
+
+  def trainModel(dataSets:Tuple3[RDD[Rating], RDD[Rating], RDD[Rating]]) = {
+
+    val training = dataSets._1
+    val validation = dataSets._2
+    val test = dataSets._3
 
     // training using ALS
-    val ranks = List(8, 12)
-    val lambdas = List(1.0, 10.0)
-    val numIters = List(10, 20)
+    val ranks = List(1)
+    val lambdas = List(0.01)
+    val numIters = List(10)
 
     var bestModel: Option[MatrixFactorizationModel] = None
     var bestValidationRmse = Double.MaxValue
@@ -118,14 +120,48 @@ object Main {
       }
     }
 
-    //val testRmse = computeRmse(bestModel.get, test, numTest)
     val testRmse = computeRmse(bestModel.get, test, true)
 
-    println("The best model was trained with rank = " + bestRank + " and lambda = " + bestLambda
-      + ", and numIter = " + bestNumIter + ", and its RMSE on the test set is " + testRmse + ".")
+    println("The best model has a testRMSE of " + testRmse)
+    bestModel
+  }
 
+  def printRecommendations(bestModel: Option[MatrixFactorizationModel], candidates: RDD[(Int, String)] )(implicit movies: RDD[(Int, String)]) = {
+    val recommendations = bestModel.get
+      .predict(candidates.map(candidate => (0, candidate._1)))
+      .collect()
+      .sortBy(- _.rating)
+      .take(10)
+
+    var i = 1
+    val moviesArr = movies.toArray()
+    println("Movies recommended for you:")
+    recommendations.foreach { r =>
+      val withMovie = movies.filter(_._1 == r.product).take(1)
+      println(r)
+      println("%2d".format(i) + ": " + withMovie(0)._1 + " - " + withMovie(0)._2)
+      i += 1
+    }
+  }
+
+  def main(args:Array[String]) = {
+    val data = sc.textFile(dataDir + "data/collab_filter.txt")
+
+    val movies = buildMoviesTuple()
+    val ratings = buildRatingsTuple()
+    val myRatings = loadRatings("data/personalRatings.txt")
+    val myRatingsRDD = sc.parallelize(myRatings)
+
+    val dataPartitions = partitionData(ratings, myRatingsRDD)
+
+    val bestModel = trainModel(dataPartitions)
+
+    val myRatedMovieIds = myRatings.map(_.product).toSet
+    val candidates = movies.filter(movie => !myRatedMovieIds.contains(movie._1))
+    printRecommendations(bestModel, candidates)(movies)
     sc.stop()
   }
+
   def computeRmse(model: MatrixFactorizationModel,
                   data: RDD[Rating],
                   implicitPrefs: Boolean) = {
